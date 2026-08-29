@@ -9,7 +9,7 @@
 ;;   Email: andrea-dev@hotmail.com
 ;; Keywords: tools
 ;; Version: 0.0.3
-;; Package-Requires: ((websocket "1.12") (request "0.3.2") (circe "2.11") (alert "1.2") (emojify "1.2.1") (emacs "25.1") (dash "2.19.1") (s "1.13.1") (ts "0.3"))
+;; Package-Requires: ((websocket "1.12") (request "0.3.2") (circe "2.11") (alert "1.2") (emojify "1.2.0") (emacs "25.1") (dash "2.19.1") (s "1.13.0") (ts "0.3"))
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
 ;; the Free Software Foundation, either version 3 of the License, or
@@ -60,6 +60,7 @@
 (require 'slack-buffer)
 (require 'slack-room-info-buffer)
 (require 'slack-message-buffer)
+(require 'slack-export)
 (require 'slack-message-edit-buffer)
 (require 'slack-message-share-buffer)
 (require 'slack-thread-message-buffer)
@@ -82,6 +83,7 @@
 (require 'slack-usergroup)
 (require 'slack-modeline)
 (require 'slack-create-message)
+(require 'slack-vip)
 
 (require 'slack-company)
 

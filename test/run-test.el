@@ -7,8 +7,12 @@
 (require 'slack-mrkdwn)
 (require 'slack-message-sender)
 (require 'slack-image)
+(require 'slack-message-buffer)
+(require 'slack-export)
+(require 'slack-user-message)
 
 (defvar slack-channel-button-keymap nil)
+(defvar slack-user-mention-keymap nil)
 (setq slack-render-image-p t)
 
 (defmacro slack-test-setup (&rest body)
@@ -113,6 +117,16 @@
                    (slack-unescape-@
                     "<@U424242>" team)))
     ))
+
+(ert-deftest slack-test-unescape-@-mention-keymap ()
+  "Mention text rendered by `slack-unescape-@' carries a `user-id'
+text property and a keymap so it can be clicked to open a profile."
+  (slack-test-setup
+    (let* ((rendered (slack-unescape-@ (format "<@%s>" user-id) team))
+           (pos (string-match (regexp-quote (format "@%s" display-name)) rendered)))
+      (should (string= user-id (get-text-property pos 'user-id rendered)))
+      (should (eq slack-user-mention-keymap
+                 (get-text-property pos 'keymap rendered))))))
 
 (ert-deftest slack-test-unescape-!subteam ()
   (slack-test-setup
@@ -824,7 +838,8 @@ https://google.com
         (let ((section (car elements)))
           (should (string= "rich_text_list" (plist-get section :type)))
           (should (string= "bullet" (plist-get section :style)))
-          (should (eq 1 (plist-get section :indent)))
+          ;; One leading space is less than one two-space indentation level.
+          (should (eq 0 (plist-get section :indent)))
           (let ((elements (plist-get section :elements)))
             (should (eq 3 (length elements)))
 
@@ -912,7 +927,8 @@ https://api.slack.com/changelog/2019-09-what-they-see-is-what-you-get-and-more-a
   (let* ((payload (list :type "rich_text_preformatted"
                         :elements (list (list :type "text" :text "code\nblock"))))
          (block (slack-create-rich-text-block-element payload)))
-    (should (string= "```code\nblock```\n"
+    ;; Rich-text preformatted blocks use fenced Markdown with line breaks.
+    (should (string= "```\ncode\nblock\n\n```\n"
                      (slack-block-to-mrkdwn block))))
   (let* ((payload (list :type "rich_text_quote"
                         :elements (list (list :type "text" :text "block\nquote"))))
@@ -987,6 +1003,366 @@ https://api.slack.com/changelog/2019-09-what-they-see-is-what-you-get-and-more-a
            (block (slack-create-rich-text-element payload)))
       (should (string= "https://google.com"
                        (slack-block-to-mrkdwn block))))))
+;;; message ranges (loaded blocks of history and the holes between them)
+
+(defun slack-test-ts (n)
+  "A realistic message timestamp for message number N.
+Slack timestamps are fixed width, which is why the code can order them with
+`string<'.  Do not shorten these to \"1\", \"7\", \"11\" in tests: as strings
+\"11\" sorts before \"7\" and the tests would exercise an ordering that never
+happens in practice."
+  (format "16000000%02d.000000" n))
+
+(defun slack-test-range (from to)
+  (cons (slack-test-ts from) (slack-test-ts to)))
+
+(ert-deftest slack-test-ranges-merge-overlapping ()
+  (should (equal (list (slack-test-range 1 5))
+                 (slack-ranges-add (list (slack-test-range 1 3))
+                                   (slack-test-ts 2) (slack-test-ts 5))))
+  ;; touching at a shared timestamp is still one block
+  (should (equal (list (slack-test-range 1 5))
+                 (slack-ranges-add (list (slack-test-range 1 3))
+                                   (slack-test-ts 3) (slack-test-ts 5))))
+  ;; a hole remains when the new block does not reach the old one
+  (should (equal (list (slack-test-range 1 3) (slack-test-range 4 5))
+                 (slack-ranges-add (list (slack-test-range 1 3))
+                                   (slack-test-ts 4) (slack-test-ts 5))))
+  ;; a block swallowed by an existing one changes nothing
+  (should (equal (list (slack-test-range 1 5))
+                 (slack-ranges-add (list (slack-test-range 1 5))
+                                   (slack-test-ts 2) (slack-test-ts 3))))
+  ;; arguments in the wrong order are tolerated
+  (should (equal (list (slack-test-range 1 5))
+                 (slack-ranges-add (list (slack-test-range 1 3))
+                                   (slack-test-ts 5) (slack-test-ts 2)))))
+
+(ert-deftest slack-test-ranges-add-joins-two-islands ()
+  ;; the scenario that motivates all of this: loading the middle of a hole
+  ;; makes the two islands one, so the load older/newer buttons disappear
+  (let ((ranges (list (slack-test-range 3 3) (slack-test-range 7 7))))
+    (setq ranges (slack-ranges-add ranges (slack-test-ts 2) (slack-test-ts 3)))
+    (should (equal (list (slack-test-range 2 3) (slack-test-range 7 7)) ranges))
+    (should (equal (list (cons (slack-test-ts 3) (slack-test-ts 7)))
+                   (slack-ranges-gaps ranges)))
+    (setq ranges (slack-ranges-add ranges (slack-test-ts 3) (slack-test-ts 7)))
+    (should (equal (list (slack-test-range 2 7)) ranges))
+    (should (null (slack-ranges-gaps ranges)))))
+
+(ert-deftest slack-test-ranges-gaps ()
+  (should (equal (list (cons (slack-test-ts 3) (slack-test-ts 7)))
+                 (slack-ranges-gaps (list (slack-test-range 1 3)
+                                          (slack-test-range 7 9)))))
+  (should (equal (list (cons (slack-test-ts 3) (slack-test-ts 7))
+                       (cons (slack-test-ts 9) (slack-test-ts 11)))
+                 (slack-ranges-gaps (list (slack-test-range 1 3)
+                                          (slack-test-range 7 9)
+                                          (slack-test-range 11 12)))))
+  (should (null (slack-ranges-gaps (list (slack-test-range 1 3)))))
+  (should (null (slack-ranges-gaps nil))))
+
+(ert-deftest slack-test-ranges-contain-p ()
+  (let ((ranges (list (slack-test-range 1 3) (slack-test-range 7 9))))
+    (should (slack-ranges-contain-p ranges (slack-test-ts 1)))
+    (should (slack-ranges-contain-p ranges (slack-test-ts 2)))
+    (should (slack-ranges-contain-p ranges (slack-test-ts 9)))
+    (should (null (slack-ranges-contain-p ranges (slack-test-ts 5))))
+    (should (null (slack-ranges-contain-p ranges (slack-test-ts 0))))))
+
+(ert-deftest slack-test-ranges-clip ()
+  ;; after trimming the store to the newest messages, blocks that are entirely
+  ;; gone disappear and the surviving one starts where the store now starts
+  (should (equal (list (slack-test-range 5 9))
+                 (slack-ranges-clip (list (slack-test-range 1 3)
+                                          (slack-test-range 4 9))
+                                    (slack-test-ts 5))))
+  (should (equal (list (slack-test-range 4 9))
+                 (slack-ranges-clip (list (slack-test-range 1 3)
+                                          (slack-test-range 4 9))
+                                    (slack-test-ts 4))))
+  (should (null (slack-ranges-clip (list (slack-test-range 1 3))
+                                   (slack-test-ts 5))))
+  (should (null (slack-ranges-clip (list (slack-test-range 1 3)) nil))))
+
+(ert-deftest slack-test-room-record-fetched-range ()
+  (let ((room (make-instance 'slack-channel :id "C1" :name "test")))
+    (slack-room-record-fetched-range room nil
+                                     :oldest (slack-test-ts 3)
+                                     :latest (slack-test-ts 5))
+    (should (equal (list (slack-test-range 3 5)) (slack-room-ranges room)))
+    (should (null (oref room history-start-reached)))
+    ;; an exhausted window with nothing in it still closes the hole, because
+    ;; the bounds we asked for are now known to be fully loaded
+    (slack-room-record-fetched-range room nil
+                                     :oldest (slack-test-ts 5)
+                                     :latest (slack-test-ts 8))
+    (should (equal (list (slack-test-range 3 8)) (slack-room-ranges room)))
+    (slack-room-record-fetched-range room nil
+                                     :oldest (slack-test-ts 1)
+                                     :latest (slack-test-ts 2)
+                                     :reached-start t)
+    (should (equal (list (slack-test-range 1 2) (slack-test-range 3 8))
+                   (slack-room-ranges room)))
+    (should (oref room history-start-reached))))
+
+(ert-deftest slack-test-room-ranges-fallback ()
+  ;; a room filled in before ranges were tracked behaves as it always did:
+  ;; everything it holds counts as one contiguous block, so no holes are drawn
+  (let ((room (make-instance 'slack-channel :id "C1" :name "test")))
+    (oset room message-ids (list (slack-test-ts 1)
+                                 (slack-test-ts 2)
+                                 (slack-test-ts 3)))
+    (should (equal (list (slack-test-range 1 3)) (slack-room-ranges room)))
+    (should (null (slack-room-gaps room)))))
+
+(ert-deftest slack-test-room-ensure-ranges-freezes-fallback ()
+  ;; jumping to an old message in a room whose ranges were never recorded: the
+  ;; guess about what we already had has to be taken BEFORE the old messages
+  ;; are stored, or the room would look contiguous and the hole would vanish
+  (let ((room (make-instance 'slack-channel :id "C1" :name "test")))
+    (oset room message-ids (list (slack-test-ts 8) (slack-test-ts 9)))
+    (slack-room-ensure-ranges room)
+    ;; the jump brings in messages 1 and 2, far away from 8 and 9
+    (oset room message-ids (list (slack-test-ts 1) (slack-test-ts 2)
+                                 (slack-test-ts 8) (slack-test-ts 9)))
+    (slack-room-add-range room (slack-test-ts 1) (slack-test-ts 2))
+    (should (equal (list (slack-test-range 1 2) (slack-test-range 8 9))
+                   (slack-room-ranges room)))
+    (should (equal (list (slack-test-range 2 8)) (slack-room-gaps room)))))
+
+(ert-deftest slack-test-room-trim-messages-clips-ranges ()
+  ;; dropping old messages must also drop the promise that we have them
+  (let ((room (make-instance 'slack-channel :id "C1" :name "test")))
+    (dolist (n '(1 2 3))
+      (puthash (slack-test-ts n)
+               (make-instance 'slack-message :ts (slack-test-ts n))
+               (oref room messages))
+      (oset room message-ids (append (oref room message-ids)
+                                     (list (slack-test-ts n)))))
+    (slack-room-add-range room (slack-test-ts 1) (slack-test-ts 3))
+    (oset room history-start-reached t)
+    (slack-room-trim-messages room 2)
+    (should (equal (list (slack-test-range 2 3)) (slack-room-ranges room)))
+    (should (null (oref room history-start-reached)))))
+
+;;; opening a message that is not loaded yet
+
+(defun slack-test-message (team room ts text &optional thread-ts)
+  (slack-message-create (append (list :type "message" :ts ts :user "U11111"
+                                      :text text)
+                                (and thread-ts (list :thread_ts thread-ts)))
+                        team room))
+
+(defmacro slack-test-with-registered-team (bindings &rest body)
+  "Run BODY with a team and channel registered in the global team tables.
+BINDINGS is (TEAM-VAR CHANNEL-VAR).  Slack looks teams up by id through those
+tables, so a buffer cannot be built without them; they are cleaned up
+afterwards, together with any buffer BODY created."
+  (declare (indent 1) (debug t))
+  (let ((team (car bindings))
+        (channel (cadr bindings)))
+    `(let* ((,team (make-instance 'slack-team
+                                  :self-id "U00000" :id "T99999"
+                                  :token "xoxb-token-for-tests"
+                                  :name "test-team"))
+            (,channel (make-instance 'slack-channel :id "C99999" :name "chan"))
+            (before (buffer-list)))
+       (puthash (oref ,team token) ,team slack-teams-by-token)
+       (puthash (oref ,team id) (oref ,team token) slack-tokens-by-id)
+       (puthash (oref ,channel id) ,channel (oref ,team channels))
+       (puthash "U11111" (list :name "tester" :id "U11111"
+                               :profile (list :display_name_normalized "Tester"
+                                              :real_name_normalized "Tester"))
+                (oref ,team users))
+       (unwind-protect
+           (progn ,@body)
+         (remhash (oref ,team token) slack-teams-by-token)
+         (remhash (oref ,team id) slack-tokens-by-id)
+         (dolist (buf (buffer-list))
+           (unless (memq buf before)
+             (kill-buffer buf)))))))
+
+(ert-deftest slack-test-open-message-loads-missing-thread ()
+  "Opening a reply whose thread root is not loaded shows the whole thread.
+Thread replies are not part of channel history, so loading messages around the
+reply cannot help: the thread has to be fetched with conversations.replies.
+The root also has to be told which messages are its replies, otherwise the
+thread buffer draws the root and the separator and nothing else."
+  (slack-test-with-registered-team (team channel)
+    (let* ((root-ts (slack-test-ts 1))
+           (reply-ts (slack-test-ts 3))
+           (browsed nil)
+           (history-calls 0)
+           (replies-ts nil)
+           ;; make the buffer current without touching windows, so that the
+           ;; jump to the linked message happens where it would in real use
+           (slack-buffer-function #'set-buffer)
+           (slack-open-message-with-browser t))
+      ;; the room holds recent history only; the thread root is older than all
+      ;; of it, so `slack-open-message' cannot find it
+      (slack-room-set-messages channel
+                               (list (slack-test-message team channel
+                                                         (slack-test-ts 8)
+                                                         "recent"))
+                               team)
+      (slack-room-add-range channel (slack-test-ts 8) (slack-test-ts 8))
+      (cl-letf (((symbol-function 'browse-url)
+                 (lambda (url &rest _) (setq browsed url)))
+                ((symbol-function 'slack-conversations-history)
+                 (lambda (&rest _) (cl-incf history-calls)))
+                ((symbol-function 'slack-conversations-replies)
+                 (lambda (room ts team &rest args)
+                   (setq replies-ts ts)
+                   ;; the real endpoint answers with the root first
+                   (funcall (plist-get args :after-success)
+                            (list (slack-test-message team room root-ts
+                                                      "the root" root-ts)
+                                  (slack-test-message team room reply-ts
+                                                      "the reply" root-ts))
+                            nil nil))))
+        (save-current-buffer
+          (slack-open-message team channel reply-ts root-ts)))
+      (should (equal root-ts replies-ts))
+      ;; channel history says nothing about replies, so asking for it is waste
+      (should (equal 0 history-calls))
+      (slack-if-let* ((buffer (slack-buffer-find 'slack-thread-message-buffer
+                                                 team channel root-ts)))
+          (with-current-buffer (slack-buffer-buffer buffer)
+            (should (string-match-p "the root" (buffer-string)))
+            (should (string-match-p "the reply" (buffer-string)))
+            ;; the permalink points at the reply, not at the root
+            (should (equal reply-ts (slack-get-ts))))
+        (ert-fail "no thread buffer was created"))
+      (should (null browsed)))))
+
+;;; lazy user fetch (`slack-user--maybe-fetch')
+(ert-deftest slack-test-user-maybe-fetch-requests-uncached-user ()
+  "Looking up an uncached user ID triggers one `slack-user-info-request'."
+  (slack-test-setup
+    (oset team token "xoxb-test-token")
+    (let ((fetch-args nil))
+      (cl-letf (((symbol-function 'slack-user-info-request)
+                 (lambda (user-id team &key after-success)
+                   (push (list user-id after-success) fetch-args)
+                   ;; simulate a successful fetch: store the user, run callback
+                   (puthash "U99999"
+                            (list :id "U99999"
+                                  :profile (list :display_name_normalized "External"
+                                                 :real_name_normalized "External"))
+                            (oref team users))
+                   (when (functionp after-success)
+                     (funcall after-success)))))
+        (should (null (slack-user--find "U99999" team)))
+        (should (equal 1 (length fetch-args)))
+        ;; after the fetch callback, the user is cached
+        (should (equal "External" (slack-user-name "U99999" team)))))))
+
+(ert-deftest slack-test-user-maybe-fetch-does-not-duplicate ()
+  "Repeated lookups for the same uncached user only fetch once."
+  (slack-test-setup
+    (oset team token "xoxb-test-token")
+    (let ((fetch-count 0))
+      (cl-letf (((symbol-function 'slack-user-info-request)
+                 (lambda (&rest _)
+                   (cl-incf fetch-count)
+                   ;; do nothing; leave user uncached so the pending guard
+                   ;; is what prevents the second call
+                   nil)))
+        (slack-user--find "U99999" team)
+        (slack-user--find "U99999" team)
+        (should (equal 1 fetch-count))))))
+
+(ert-deftest slack-test-user-maybe-fetch-skips-bots ()
+  "Bot IDs (starting with B) are not fetched via `users.info'."
+  (slack-test-setup
+    (oset team token "xoxb-test-token")
+    (let ((fetch-count 0))
+      (cl-letf (((symbol-function 'slack-user-info-request)
+                 (lambda (&rest _) (cl-incf fetch-count))))
+        (slack-user--find "B12345" team)
+        (should (equal 0 fetch-count))))))
+
+(ert-deftest slack-test-user-maybe-fetch-cached-user-no-fetch ()
+  "A cached user is returned without triggering a fetch."
+  (slack-test-setup
+    (let ((fetch-count 0))
+      (cl-letf (((symbol-function 'slack-user-info-request)
+                 (lambda (&rest _) (cl-incf fetch-count))))
+        (should (eq (car (gethash "U11111" (oref team users)))
+                    (car (slack-user--find "U11111" team))))
+        (should (equal 0 fetch-count))))))
+
+(ert-deftest slack-test-user-maybe-fetch-no-token-no-fetch ()
+  "When the team has no token, no fetch is attempted."
+  (slack-test-setup
+    (let ((fetch-count 0))
+      (cl-letf (((symbol-function 'slack-user-info-request)
+                 (lambda (&rest _) (cl-incf fetch-count))))
+        (slack-user--find "U99999" team)
+        (should (equal 0 fetch-count))))))
+
+(ert-deftest slack-test-user-timezone-missing-tz-offset ()
+  "Timezone functions return nil for users without `tz_offset'
+\(e.g. external/Slack-Connect users) instead of crashing."
+  (let ((external-user (list :id "UEXT01"
+                             :profile (list :display_name_normalized "External"
+                                            :real_name_normalized "External")))
+        (nil-user nil))
+    (should (null (slack-user-timezone external-user)))
+    (should (null (slack-user-local-time external-user)))
+    (should (null (slack-user-timezone nil-user)))
+    (should (null (slack-user-local-time nil-user)))))
+
+(ert-deftest slack-test-user-hidden-p-missing-deleted-field ()
+  "Users without a `:deleted' field are not hidden.  External/Slack-Connect
+users fetched via `users.info' often lack this field."
+  (should (null (slack-user-hidden-p (list :id "UEXT01" :profile nil))))
+  (should (null (slack-user-hidden-p (list :id "U11111" :deleted :json-false))))
+  (should (slack-user-hidden-p (list :id "U11111" :deleted t))))
+
+;;; reply-broadcast message user-ids scans text for mentions
+(ert-deftest slack-test-reply-broadcast-user-ids-includes-mentions ()
+  "A reply-broadcast message collects mentioned user IDs from text, not
+just the sender."
+  (slack-test-setup
+    (let ((msg (slack-message-create
+                (list :type "message"
+                      :subtype "thread_broadcast"
+                      :ts (slack-test-ts 5)
+                      :user "U11111"
+                      :text "Hey <@U22222> and <@U33333>")
+                team
+                channel)))
+      (should (eq 'slack-reply-broadcast-message
+                  (eieio-object-class-name msg)))
+      (let ((ids (slack-message-user-ids msg)))
+        (should (member "U11111" ids))
+        (should (member "U22222" ids))
+        (should (member "U33333" ids))))))
+
+(load (expand-file-name
+       "slack-export-test.el"
+       (file-name-directory (or load-file-name buffer-file-name)))
+      nil
+      nil)
+
+(load (expand-file-name
+       "slack-modeline-test.el"
+       (file-name-directory (or load-file-name buffer-file-name)))
+      nil
+      nil)
+
+(load (expand-file-name
+       "slack-vip-test.el"
+       (file-name-directory (or load-file-name buffer-file-name)))
+      nil
+      nil)
+
+(load (expand-file-name
+       "slack-activity-feed-test.el"
+       (file-name-directory (or load-file-name buffer-file-name)))
+      nil
+      nil)
 
 (if noninteractive
     (ert-run-tests-batch-and-exit)

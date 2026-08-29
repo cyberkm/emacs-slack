@@ -33,6 +33,7 @@
 (require 'slack-unescape)
 (require 'slack-message-faces)
 (require 'slack-defcustoms)
+(require 'slack-vip)
 
 (defvar slack-current-buffer)
 
@@ -259,6 +260,7 @@
 (cl-defmethod slack-message-header ((this slack-message) team)
   (let* ((name (slack-message-sender-name this team))
          (user-id (slack-message-sender-id this))
+         (name (slack-user-vip-propertize-name name user-id team))
          (status (slack-message-user-status this team))
          (edited-at (slack-format-ts (slack-message-edited-at this)))
          (deleted-at (slack-format-ts (oref this deleted-at))))
@@ -276,7 +278,8 @@
                'help-echo (let ((user (slack-user--find user-id team)))
                             (lambda (_window _string _pos)
                               (format "%s - %s"
-                                      (slack-user-local-time user)
+                                      (or (slack-user-local-time user)
+                                          "Unknown time")
                                       (if-let ((p (plist-get (plist-get user :profile) :pronouns)))
                                           p
                                         ""))))
@@ -380,6 +383,50 @@ or not."
           (nth 0 it)
           (slack-message-create it team room)))
     ))
+
+(defun slack-message-get-or-fetch-async (ts room-id team &optional thread-ts after-success)
+  "Get message for TS in ROOM-ID of TEAM, fetching asynchronously if needed.
+If the message is already cached locally, call AFTER-SUCCESS immediately
+with it.  Otherwise dispatch a non-blocking `conversations.history' (or
+`conversations.replies' for thread replies) and call AFTER-SUCCESS with
+the fetched message (or nil if nothing came back) when it arrives.
+THREAD-TS anchors a thread reply fetch (defaults to TS).  Unlike
+`slack-message-get-or-fetch', this never blocks Emacs."
+  (let* ((thread-ts (or thread-ts ts))
+         (room (slack-room-find room-id team))
+         (message (and room
+                       (condition-case err
+                           (slack-room-find-message room ts)
+                         (error
+                          (message "error in: %s" (error-message-string err))
+                          nil))))
+         (thread-ts-second-half (nth 1 (s-split "\\." thread-ts))))
+    (if message
+        (when (functionp after-success)
+          (funcall after-success message))
+      (if (not room)
+          (when (functionp after-success)
+            (funcall after-success nil))
+        (cl-labels
+            ((on-messages (messages &rest _)
+               (let ((msg (and (consp messages) (nth 0 messages))))
+                 (when msg
+                   (slack-room-push-message room msg team))
+                 (when (functionp after-success)
+                   (funcall after-success msg)))))
+          (if (and thread-ts-second-half
+                   (not (string-equal ts thread-ts)))
+              ;; When TS belongs to a thread reply, fetch via replies.
+              (slack-conversations-replies room ts team
+                                           :inclusive "true"
+                                           :limit "1"
+                                           :after-success #'on-messages)
+            ;; Otherwise fetch from channel history at TS.
+            (slack-conversations-history room team
+                                         :latest ts
+                                         :inclusive "true"
+                                         :limit "1"
+                                         :after-success #'on-messages)))))))
 
 (provide 'slack-message)
 ;;; slack-message.el ends here

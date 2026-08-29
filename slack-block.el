@@ -33,6 +33,7 @@
 (require 'slack-usergroup)
 (require 'slack-mrkdwn)
 (require 'slack-room)
+(require 'slack-vip)
 
 (defcustom slack-block-highlight-source nil
   "If non-nil, highlight source blocks in messages.
@@ -73,6 +74,7 @@ Without it, buffers using a proportional font (via `buffer-face-mode' or
 
 (defvar slack-completing-read-function)
 (defvar slack-channel-button-keymap)
+(defvar slack-user-mention-keymap)
 (defvar slack-current-buffer)
 
 ;; Layout Blocks
@@ -111,6 +113,10 @@ Without it, buffers using a proportional font (via `buffer-face-mode' or
       (slack-create-plan-layout-block payload))
      ((string= "table" type)
       (slack-create-table-layout-block payload))
+     ((string= "timeline" type)
+      (slack-create-timeline-layout-block payload))
+     ((string= "video" type)
+      (slack-create-video-layout-block payload))
      (t (make-instance 'slack-layout-block
                        :type type
                        :payload payload))
@@ -369,6 +375,134 @@ Without it, buffers using a proportional font (via `buffer-face-mode' or
                  (list hline))
          "\n")))))
 
+(defface slack-timeline-point-complete-face
+  '((t (:foreground "#859900")))
+  "Face for completed timeline points."
+  :group 'slack)
+
+(defface slack-timeline-point-in-progress-face
+  '((t (:foreground "#b58900")))
+  "Face for in-progress timeline points."
+  :group 'slack)
+
+(defface slack-timeline-point-pending-face
+  '((t (:foreground "#586e75")))
+  "Face for pending timeline points."
+  :group 'slack)
+
+(defclass slack-timeline-point ()
+  ((id :initarg :id :type (or null string) :initform nil)
+   (text :initarg :text :type (or null string) :initform nil)
+   (status :initarg :status :type (or null string) :initform nil)
+   (contents :initarg :contents :type (or null list) :initform nil)
+   (icon :initarg :icon :type (or null string) :initform nil)))
+
+(defun slack-create-timeline-point (payload)
+  (make-instance 'slack-timeline-point
+                 :id (plist-get payload :id)
+                 :text (plist-get payload :text)
+                 :status (plist-get payload :status)
+                 :contents (plist-get payload :contents)
+                 :icon (plist-get payload :icon)))
+
+(cl-defmethod slack-block-to-string ((this slack-timeline-point) &optional _option)
+  (with-slots (text status) this
+    (let ((marker (cond ((string= "complete" status)
+                         (propertize "✓" 'face 'slack-timeline-point-complete-face))
+                        ((string= "in_progress" status)
+                         (propertize "◐" 'face 'slack-timeline-point-in-progress-face))
+                        (t (propertize "○" 'face 'slack-timeline-point-pending-face)))))
+      (format "  %s %s" marker (or text "")))))
+
+(defclass slack-timeline-layout-block (slack-layout-block)
+  ((type :initarg :type :type string :initform "timeline")
+   (points :initarg :points :type list :initform nil)
+   (start-ts :initarg :start_ts :type (or null number) :initform nil)
+   (end-ts :initarg :end_ts :type (or null number) :initform nil)))
+
+(defun slack-create-timeline-layout-block (payload)
+  (make-instance 'slack-timeline-layout-block
+                 :type (plist-get payload :type)
+                 :block_id (plist-get payload :block_id)
+                 :points (mapcar #'slack-create-timeline-point
+                                 (plist-get payload :points))
+                 :start_ts (plist-get payload :start_ts)
+                 :end_ts (plist-get payload :end_ts)
+                 :payload payload))
+
+(cl-defmethod slack-block-to-string ((this slack-timeline-layout-block) &optional option)
+  (with-slots (points) this
+    (if points
+        (concat (mapconcat #'(lambda (point) (slack-block-to-string point option))
+                            points
+                            "\n")
+                "\n")
+      "")))
+
+(defface slack-video-block-title-face
+  '((t (:weight bold)))
+  "Face for video block title."
+  :group 'slack)
+
+(defface slack-video-block-meta-face
+  '((t (:foreground "#586e75")))
+  "Face for video block metadata."
+  :group 'slack)
+
+(defclass slack-video-layout-block (slack-layout-block)
+  ((type :initarg :type :type string :initform "video")
+   (video-url :initarg :video_url :type (or null string) :initform nil)
+   (thumbnail-url :initarg :thumbnail_url :type (or null string) :initform nil)
+   (alt-text :initarg :alt_text :type (or null string) :initform nil)
+   (title :initarg :title :type (or null slack-text-message-composition-object) :initform nil)
+   (title-url :initarg :title_url :type (or null string) :initform nil)
+   (author-name :initarg :author_name :type (or null string) :initform nil)
+   (provider-name :initarg :provider_name :type (or null string) :initform nil)
+   (provider-icon-url :initarg :provider_icon_url :type (or null string) :initform nil)
+   (description :initarg :description :type (or null slack-text-message-composition-object) :initform nil)))
+
+(defun slack-create-video-layout-block (payload)
+  (make-instance 'slack-video-layout-block
+                 :type (plist-get payload :type)
+                 :block_id (plist-get payload :block_id)
+                 :video_url (plist-get payload :video_url)
+                 :thumbnail_url (plist-get payload :thumbnail_url)
+                 :alt_text (plist-get payload :alt_text)
+                 :title (slack-create-text-message-composition-object
+                         (plist-get payload :title))
+                 :title_url (plist-get payload :title_url)
+                 :author_name (plist-get payload :author_name)
+                 :provider_name (plist-get payload :provider_name)
+                 :provider_icon_url (plist-get payload :provider_icon_url)
+                 :description (slack-create-text-message-composition-object
+                               (plist-get payload :description))
+                 :payload payload))
+
+(cl-defmethod slack-block-to-string ((this slack-video-layout-block) &optional _option)
+  (with-slots (video-url title title-url author-name provider-name description alt-text) this
+    (let* ((title-str (when title (slack-block-to-string title)))
+           (desc-str (when description (slack-block-to-string description)))
+           (parts (cl-remove-if #'null
+                     (list (when title-str
+                             (propertize title-str 'face 'slack-video-block-title-face))
+                           (when author-name
+                             (propertize (format "by %s" author-name)
+                                         'face 'slack-video-block-meta-face))
+                           (when provider-name
+                             (propertize (format "on %s" provider-name)
+                                         'face 'slack-video-block-meta-face))
+                           (when desc-str
+                             (propertize desc-str 'face 'slack-video-block-meta-face))
+                           (when (or title-url video-url)
+                             (propertize "[video]"
+                                         'face 'slack-channel-button-face
+                                         'slack-attachment-mention-url (or title-url video-url)
+                                         'keymap slack-attachment-mention-keymap
+                                         'help-echo "RET: open video"))))))
+      (if parts
+          (concat (mapconcat #'identity parts " · ") "\n")
+        ""))))
+
 (defclass slack-rich-text-block-element ()
   ((type :initarg :type :type string)
    (elements :initarg :elements :type list) ;; list of slack-rich-text-element
@@ -625,6 +759,8 @@ Without it, buffers using a proportional font (via `buffer-face-mode' or
                     (slack-create-rich-text-attachment-mention-element payload))
                    ((string= "canvas" type)
                     (slack-create-rich-text-canvas-element payload))
+                   ((string= "citation" type)
+                    (slack-create-rich-text-citation-element payload))
                    (t
                     (make-instance 'slack-rich-text-element
                                    :type (plist-get payload :type)
@@ -697,8 +833,14 @@ Without it, buffers using a proportional font (via `buffer-face-mode' or
         (id (oref this user-id)))
     (unless team
       (error "`slack-rich-text-user-element' need team as option"))
-    (propertize (format "@%s" (or (slack-user-name id team) id))
-                'face 'slack-message-mention-face)))
+    (let ((text (propertize (format "@%s" (or (slack-user-name id team) id))
+                           'user-id id
+                           'mouse-face 'highlight
+                           'keymap slack-user-mention-keymap
+                           'face 'slack-message-mention-face)))
+      (when (slack-user-vip-p-id id team)
+        (add-face-text-property 0 (length text) 'slack-user-vip-face nil text))
+      text)))
 
 (cl-defmethod slack-block-to-mrkdwn ((this slack-rich-text-user-element) option)
   (let ((team (plist-get option :team))
@@ -900,6 +1042,81 @@ Without it, buffers using a proportional font (via `buffer-face-mode' or
                  :type (plist-get payload :type)
                  :file_id (plist-get payload :file_id)
                  :url (plist-get payload :url)
+                 :style (slack-create-rich-text-element-style
+                         (plist-get payload :style))))
+
+(defclass slack-rich-text-citation-element (slack-rich-text-element)
+  ((text :initarg :text :type (or null string) :initform nil)
+   (url :initarg :url :type (or null string) :initform nil)
+   (index :initarg :index :type (or null number) :initform nil)
+   (details :initarg :details :type (or null list) :initform nil)))
+
+(defvar slack-citation-keymap
+  (let ((keymap (make-sparse-keymap)))
+    (define-key keymap (kbd "RET") #'slack-open-citation)
+    (define-key keymap [mouse-1] #'slack-open-citation)
+    (define-key keymap (kbd "w") #'slack-copy-citation-url)
+    keymap))
+
+(defun slack-copy-citation-url ()
+  "Copy the citation URL at point to the kill ring."
+  (interactive)
+  (let ((url (get-text-property (point) 'slack-message-mention-url)))
+    (when url
+      (kill-new url)
+      (message "Copied: %s" url))))
+
+(defun slack-open-citation ()
+  "Open the citation message at point."
+  (interactive)
+  (let ((url (get-text-property (point) 'slack-message-mention-url))
+        (channel-id (get-text-property (point) 'slack-citation-channel-id))
+        (message-ts (get-text-property (point) 'slack-citation-message-ts)))
+    (if (and channel-id message-ts)
+        (cl-block nil
+          (let* ((team (cl-find-if
+                        #'(lambda (team)
+                            (slack-room-find channel-id team))
+                        (hash-table-values slack-teams-by-token))))
+            (when team
+              (let ((room (slack-room-find channel-id team)))
+                (when room
+                  (slack-open-message team room message-ts nil)
+                  (cl-return t)))))
+          (when url (browse-url url)))
+      (when url (browse-url url)))))
+
+(cl-defmethod slack-block-to-string ((this slack-rich-text-citation-element) &optional _option)
+  (let ((url (oref this url))
+        (text (or (oref this text) ""))
+        (details (oref this details))
+        (channel-id nil)
+        (message-ts nil))
+    (when details
+      (setq channel-id (plist-get details :channel)
+            message-ts (plist-get details :message_ts)))
+    (propertize text
+                'face 'slack-channel-button-face
+                'slack-message-mention-url url
+                'slack-citation-channel-id channel-id
+                'slack-citation-message-ts message-ts
+                'keymap slack-citation-keymap
+                'help-echo (format "RET: open message\n%s" url))))
+
+(cl-defmethod slack-block-to-mrkdwn ((this slack-rich-text-citation-element) &optional _option)
+  (let ((text (oref this text))
+        (url (oref this url)))
+    (if (and text url)
+        (format "[%s](%s)" text url)
+      (or text url ""))))
+
+(defun slack-create-rich-text-citation-element (payload)
+  (make-instance 'slack-rich-text-citation-element
+                 :type (plist-get payload :type)
+                 :text (plist-get payload :text)
+                 :url (plist-get payload :url)
+                 :index (plist-get payload :index)
+                 :details (plist-get payload :details)
                  :style (slack-create-rich-text-element-style
                          (plist-get payload :style))))
 
