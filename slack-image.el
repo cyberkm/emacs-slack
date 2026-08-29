@@ -125,7 +125,9 @@
    slack-profile-image-file-directory))
 
 (cl-defun slack-image--create (path &key (width nil) (height nil) (max-height nil) (max-width nil))
-  (let* ((imagemagick-available-p (image-type-available-p 'imagemagick))
+  (let* ((animated (slack-image--animated-p path))
+         (imagemagick-available-p (and (image-type-available-p 'imagemagick)
+                                       (not animated)))
          (image (apply #'create-image (append (list path (and imagemagick-available-p 'imagemagick) nil)
                                               (if height (list :height height))
                                               (if width (list :width width))
@@ -217,10 +219,45 @@ DISPLAY-PROP may be a sliced image specification or an image object."
     )
   )
 
+(defun slack-image--animated-p (file)
+  "Return non-nil when FILE is an animated image format.
+SVG-wrapping and imagemagick conversion both kill animation, so
+files in these formats are left as native images.  Detection is
+done by sniffing the file's magic bytes -- the cached filenames
+Slack uses don't always carry a recognisable extension."
+  (and (file-readable-p file)
+       (with-temp-buffer
+         (set-buffer-multibyte nil)
+         (insert-file-contents-literally file nil 0 32)
+         (let ((header (buffer-substring-no-properties (point-min) (point-max))))
+           (or
+            ;; GIF87a / GIF89a
+            (string-prefix-p "GIF8" header)
+            ;; Animated WebP: "RIFF????WEBPVP8X..." with ANIM chunk
+            (and (string-prefix-p "RIFF" header)
+                 (string-match-p "WEBP" header)
+                 (string-match-p "ANIM" header))
+            ;; APNG: PNG signature plus an acTL chunk somewhere
+            (and (string-prefix-p "\x89PNG\r\n\x1a\n" header)
+                 ;; acTL within first 32 bytes is unusual; fall through
+                 ;; to a deeper scan only if PNG signature is present.
+                 (let ((more (with-temp-buffer
+                               (set-buffer-multibyte nil)
+                               (insert-file-contents-literally
+                                file nil 0 (min 4096
+                                                 (file-attribute-size
+                                                  (file-attributes file))))
+                               (buffer-substring-no-properties
+                                (point-min) (point-max)))))
+                   (string-match-p "acTL" more))))))))
+
 (defun slack-image--round-content (file image)
   "Wrap IMAGE (created from FILE) in an SVG with small rounded corners.
-Returns IMAGE unchanged if SVG is not available."
-  (if (and (image-type-available-p 'svg) (file-exists-p file))
+Returns IMAGE unchanged if SVG is not available, or if FILE is an
+animated format (animation is lost when wrapped in SVG)."
+  (if (and (image-type-available-p 'svg)
+           (file-exists-p file)
+           (not (slack-image--animated-p file)))
       (let* ((size (image-size image t))
              (w (car size))
              (h (cdr size)))
@@ -260,7 +297,9 @@ when SVG support is not available.  Results are cached."
   (let ((key (cons file size)))
     (or (gethash key slack-image--profile-cache)
         (puthash key
-                 (if (and (image-type-available-p 'svg) (file-exists-p file))
+                 (if (and (image-type-available-p 'svg)
+                          (file-exists-p file)
+                          (not (slack-image--animated-p file)))
                      (let* ((r (/ size 4))
                             (ext (or (file-name-extension file) "png"))
                             (mime (concat "image/" (if (string= ext "jpg") "jpeg" ext)))

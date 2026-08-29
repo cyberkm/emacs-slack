@@ -61,6 +61,16 @@ You need to install `language-detection' for this to work."
   "If non-nil, highlight source blocks in messages.
 You need to install `language-detection' for this to work.")
 
+(defface slack-block-fixed-pitch-face
+  '((t (:inherit fixed-pitch)))
+  "Face for blocks whose layout depends on character-cell alignment.
+Applied as an overlay to source blocks and tables, so it should supply
+only the font family: the colors and weights set by the block itself
+(font-lock faces, `slack-table-border-face', …) are merged on top of it.
+Without it, buffers using a proportional font (via `buffer-face-mode' or
+`variable-pitch-mode') render these blocks misaligned."
+  :group 'slack)
+
 (defvar slack-completing-read-function)
 (defvar slack-channel-button-keymap)
 (defvar slack-current-buffer)
@@ -340,14 +350,24 @@ You need to install `language-detection' for this to work.")
                                                               " "
                                                               border)))
                                      )))
-        (concat hline "\n"
-                (funcall format-row (car rendered-rows) t) "\n"
-                hline "\n"
-                (mapconcat #'(lambda (row) (funcall format-row row nil))
-                           (cdr rendered-rows)
-                           (concat "\n"))
-                (when (cdr rendered-rows) "\n")
-                hline)))))
+        ;; Cell widths are computed with `string-width', so the table only
+        ;; lines up in a fixed-pitch font.  Tag each line separately (the
+        ;; newlines in between end the property run) rather than the whole
+        ;; table at once, so `slack-add-face-lazy' sees a bounded region.
+        (mapconcat
+         #'(lambda (line)
+             (propertize line
+                         'slack-defer-face
+                         #'(lambda (beg end)
+                             (overlay-put (make-overlay beg end)
+                                          'face 'slack-block-fixed-pitch-face))))
+         (append (list hline
+                       (funcall format-row (car rendered-rows) t)
+                       hline)
+                 (mapcar #'(lambda (row) (funcall format-row row nil))
+                         (cdr rendered-rows))
+                 (list hline))
+         "\n")))))
 
 (defclass slack-rich-text-block-element ()
   ((type :initarg :type :type string)
@@ -423,11 +443,13 @@ You need to install `language-detection' for this to work.")
            (lambda (s)
              (propertize
               (if (string= "" s) " " s)
-              'slack-defer-face #'(lambda (beg _end)
+              'slack-defer-face #'(lambda (beg end)
                                     (let ((ov (make-overlay beg beg)))
                                       (overlay-put
                                        ov 'before-string
-                                       (propertize "│" 'face 'slack-block-highlight-source-overlay-face))))))
+                                       (propertize "│" 'face 'slack-block-highlight-source-overlay-face)))
+                                    (overlay-put (make-overlay beg end)
+                                                 'face 'slack-block-fixed-pitch-face))))
            (string-split (string-trim hl-text) "\n"))
           "\n")
          "\n"
